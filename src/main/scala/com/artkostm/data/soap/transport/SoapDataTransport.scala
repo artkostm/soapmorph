@@ -1,11 +1,11 @@
-package com.petrofac.data.ingest.p6.transport
+package com.artkostm.data.ingest.p6.transport
 
-import com.petrofac.data.ingest.p6.config.{ServiceEntity, SoapTransportConfig}
-import com.petrofac.data.ingest.p6.transport.SoapTransport.PayloadTransformer
-import com.petrofac.data.soap.client.{GenericStreamingResponse, SoapClient}
-import com.petrofac.data.landing.rest.fs.AvroWriter
-import com.petrofac.data.landing.rest.logger
-import com.petrofac.data.soap.client.schema.{Avro, DataF, SchemaF}
+import com.artkostm.data.ingest.p6.config.{ServiceEntity, SoapTransportConfig}
+import com.artkostm.data.ingest.p6.transport.SoapTransport.PayloadTransformer
+import com.artkostm.data.soap.client.{GenericStreamingResponse, SoapClient}
+import com.artkostm.data.landing.rest.fs.AvroWriter
+import com.artkostm.data.landing.rest.logger
+import com.artkostm.data.soap.client.schema.{Avro, DataF, SchemaF}
 import higherkindness.droste.data.Fix
 import org.apache.avro.Schema
 import org.apache.avro.generic.GenericRecord
