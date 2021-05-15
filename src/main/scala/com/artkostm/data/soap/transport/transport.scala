@@ -1,9 +1,9 @@
-package com.artkostm.data.soap
+package com.petrofac.data.ingest.p6
 
-import com.artkostm.data.soap.client.SoapClient
-import com.artkostm.data.soap.config.SoapTransportConfig
-import com.artkostm.data.soap.transport.SoapTransport.PayloadTransformer
-import com.artkostm.data.landing.rest.fs.AvroWriter
+import com.petrofac.data.ingest.p6.config.SoapTransportConfig
+import com.petrofac.data.ingest.p6.transport.SoapTransport.PayloadTransformer
+import com.petrofac.data.landing.rest.fs.AvroWriter
+import com.petrofac.data.soap.client.SoapClient
 import izumi.reflect.Tag
 import zio.{Has, Task, ZIO, ZLayer}
 

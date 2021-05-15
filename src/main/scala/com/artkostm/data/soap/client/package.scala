@@ -1,20 +1,20 @@
 package com.artkostm.data.soap
 
+import com.artkostm.data.soap.client.schema.{DataF, SchemaF}
 import com.artkostm.data.soap.client.wsdl.{UrlWsdlLoader, WsdlDefinition}
 import com.artkostm.data.soap.config.SoapClientConfig
-import org.apache.avro.generic.GenericRecord
+import higherkindness.droste.data.Fix
 import sttp.client3.asynchttpclient.zio.AsyncHttpClientZioBackend
 import zio.stream.Stream
-import zio.{Has, Ref, Task, ZIO, ZLayer}
+import zio.{Has, Ref, Task, ZLayer}
 
-import scala.xml.{Elem, NamespaceBinding}
+import scala.xml.NamespaceBinding
 
 
 package object client {
-  type SoapClient  = Has[SoapClient.Service]
+  type SoapClient = Has[SoapClient.Service]
 
-  final def read(action: String, wsdlUrl: String)(data: Map[String, List[String]]): ZIO[SoapClient, Throwable, Stream[Throwable, GenericRecord]] =
-    ZIO.accessM(_.get.read(action, wsdlUrl)(data))
+  type GenericStreamingResponse = (Fix[SchemaF], Stream[Throwable, Fix[DataF]])
 
   object SoapClient {
 
@@ -26,8 +26,9 @@ package object client {
       }
 
     trait Service {
-      def read(action: String, wsdlUrl: String)(data: Map[String, List[String]]): Task[Stream[Throwable, GenericRecord]]
-      def readEntity(service: String, action: String, xmlElement: String, namespace: NamespaceBinding)(data: Map[String, List[String]]): Task[Stream[Throwable, Map[String, String]]]
+      def readData(action: String, wsdlUrl: String)(data: Map[String, List[String]]): Task[GenericStreamingResponse]
+      def readData(service: String, action: String, xmlElement: String, namespace: NamespaceBinding)
+                  (data: Map[String, List[String]]): Task[Stream[Throwable, Map[String, String]]]
     }
   }
 }

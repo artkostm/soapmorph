@@ -1,9 +1,16 @@
 package com.artkostm.data.soap.client.schema
 
 import cats.implicits._
-import cats.{Applicative, Functor, Traverse}
+import cats.{Applicative, Functor, Monad, Traverse}
+import com.artkostm.data.soap.client.schema.Avro.EnvT
 import com.artkostm.data.soap.client.schema.DataF._
+import com.artkostm.data.soap.client.schema.SchemaF.{ArrayF, StructF}
+import higherkindness.droste.CoalgebraM
+import higherkindness.droste.data.{AttrF, Fix}
+import higherkindness.droste.syntax.all.toFixSyntaxOps
 import higherkindness.droste.util.DefaultTraverse
+
+import scala.language.higherKinds
 
 sealed trait DataF[A] {
   def traverse[F[_]: Applicative, B](f: A => F[B]): F[DataF[B]] = this match {
@@ -35,6 +42,28 @@ sealed trait GValue[A] extends DataF[A] {
 }
 
 object DataF {
+  implicit class FixedData(d: Fix[DataF]) {
+    def get(fieldName: String): Option[Any] = {
+      def search(dd: Fix[DataF]): Option[Fix[DataF]] = dd match {
+        case Fix(GStruct(fields))  => fields.get(fieldName).flatMap(search)
+        case f @ Fix(_: GValue[_]) => Some(f)
+        case _                     => None
+      }
+
+      search(d).flatMap(Fix.un(_) match {
+        case field: GValue[_] => Option(field.value)
+        case _                => None
+      })
+    }
+  }
+
+  def isNotNull(d: Fix[DataF]): Boolean =
+    Fix.un(d) match {
+      case GNull() => false
+      case _       => true
+    }
+
+  val nullF: Fix[DataF] = GNull().fix[DataF]
 
   final case class GStruct[A](fields: Map[String, A]) extends DataF[A]
   final case class GArray[A](elements: Seq[A])        extends DataF[A]
@@ -48,6 +77,27 @@ object DataF {
   final case class GNull[A]() extends GValue[A] {
     override val value: Any = null
   }
+
+  // zip SchemaF with DataF - we need this because it is not possible to construct avro's generic record without schema
+  def zipWithSchema[M[_]: Monad]: CoalgebraM[M, EnvT, (Fix[SchemaF], Fix[DataF])] =
+    CoalgebraM[M, EnvT, (Fix[SchemaF], Fix[DataF])] {
+      case (structF @ Fix(StructF(fields, _)), Fix(GStruct(values))) =>
+        AttrF
+          .apply[DataF, Fix[SchemaF], (Fix[SchemaF], Fix[DataF])](
+            (structF, GStruct(values.map {
+              case (name, value) => (name, (fields.apply(name), value))
+            }))
+          )
+          .pure[M]
+      case (arrayF @ Fix(ArrayF(elementSchema, _)), Fix(GArray(values))) =>
+        AttrF
+          .apply[DataF, Fix[SchemaF], (Fix[SchemaF], Fix[DataF])](arrayF, GArray(values.map { e =>
+            elementSchema -> e
+          }))
+          .pure[M]
+      case (schemaF, Fix(lower)) =>
+        AttrF.apply[DataF, Fix[SchemaF], (Fix[SchemaF], Fix[DataF])](schemaF, lower.map((schemaF, _))).pure[M]
+    }
 
   implicit val dataTraverse: Traverse[DataF] = new DefaultTraverse[DataF] {
     override def traverse[G[_]: Applicative, A, B](fa: DataF[A])(f: A => G[B]): G[DataF[B]] =

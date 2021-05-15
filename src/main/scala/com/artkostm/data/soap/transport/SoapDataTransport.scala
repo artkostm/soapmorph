@@ -1,11 +1,12 @@
-package com.artkostm.data.soap.transport
+package com.petrofac.data.ingest.p6.transport
 
-import com.artkostm.data.soap.client.SoapClient
-import com.artkostm.data.soap.config.{SoapTransportConfig, ServiceEntity}
-import com.artkostm.data.soap.transport.SoapTransport.PayloadTransformer
-import com.artkostm.data.landing.rest.avro.AvroHelper.{createAvroSchemaFromRow, createGenericRecord}
-import com.artkostm.data.landing.rest.fs.AvroWriter
-import com.artkostm.data.landing.rest.logger
+import com.petrofac.data.ingest.p6.config.{ServiceEntity, SoapTransportConfig}
+import com.petrofac.data.ingest.p6.transport.SoapTransport.PayloadTransformer
+import com.petrofac.data.soap.client.{GenericStreamingResponse, SoapClient}
+import com.petrofac.data.landing.rest.fs.AvroWriter
+import com.petrofac.data.landing.rest.logger
+import com.petrofac.data.soap.client.schema.{Avro, DataF, SchemaF}
+import higherkindness.droste.data.Fix
 import org.apache.avro.Schema
 import org.apache.avro.generic.GenericRecord
 import org.slf4j.{Logger, LoggerFactory}
@@ -20,16 +21,16 @@ class SoapDataTransport(client: SoapClient.Service, avroWriter: AvroWriter.Servi
   extends SoapTransport.Service {
   import SoapDataTransport._
 
-  type ApiCall = (ServiceEntity, Map[String, List[String]]) => Task[Stream[Throwable, Map[String, String]]]
+  type ApiCall = (ServiceEntity, Map[String, List[String]]) => Task[GenericStreamingResponse]
 
   override def run(enrichPayload: PayloadTransformer): Task[Unit] =
     ZIO.foreach_(config.transport) {
       case (entityName, c) =>
-        val partition = partitions(entityName, LocalDateTime.now(JClock.systemUTC()), config.launchId)
+        val partition = partitions(c.name, LocalDateTime.now(JClock.systemUTC()), config.launchId)
         Ref.make(false).flatMap { dataWritten =>
           load(dataWritten, entityName, c, enrichPayload(c.payload), partition) { (se, payload) =>
-            delayCall(c) *> client.readEntity(se.service, se.action, se.xmlElement, se.namespace.value)(payload)
-          } *> dataWritten.get >>= (ZIO.when(_)(logger.state(config, entityName, partition, "SUCCESS")))
+            delayCall(c) *> client.readData(se.action, se.wsdlUrl)(payload)
+          } *> dataWritten.get >>= (ZIO.when(_)(logger.state(config, c.name, partition, "SUCCESS")))
         }
     }
 
@@ -40,34 +41,35 @@ class SoapDataTransport(client: SoapClient.Service, avroWriter: AvroWriter.Servi
                    partition: String)(call: ApiCall): Task[Unit] =
     for {
       _ <- logger.info(s"Loading data for $entityName...")
-      streams <- ZIO.foreachParN(config.parallelization)(payload) { p =>
-        call(c, p).map(s => s.chunkN(config.chunkSize))
+      genericStreamingResponse <- ZIO.foreachParN(config.parallelization)(payload) { p =>
+        call(c, p).map(s => (s._1, s._2.chunkN(config.chunkSize)))
       }
-      mainStream = streams.foldLeft(Stream.succeed(Map.empty[String, String]): Stream[Throwable, Map[String,String]]) {
-        case (accStream, stream) => accStream.filter(_.nonEmpty).merge(stream)
-      }.broadcast(c.children.size + 1, MaxLag)
+      (schema, stream) = genericStreamingResponse.foldLeft((SchemaF.emptyStruct, Stream.succeed(DataF.nullF)): (Fix[SchemaF], Stream[Throwable, Fix[DataF]])) {
+        case ((_, accStream), (sc, stream)) => sc -> accStream.filter(DataF.isNotNull).merge(stream)
+      }
+      avroSchema = Avro.toAvroSchema(schema)
+      mainStream = stream.broadcast(c.children.size + 1, MaxLag)
       _ <- mainStream.use {
         case toSave :: tail =>
           for {
             _ <- toSave.foreachChunk { chunk =>
               chunk.headOption
-                .map(createAvroSchemaFromRow)
-                .map { avroSchema =>
-                  saveAvro(chunk.map(row => createGenericRecord(row, avroSchema)), avroSchema)(
-                    dataWritten,
-                    avroWriter,
-                    partition
-                  )
-                }
-                .getOrElse(ZIO.unit)
+                  .map { _ =>
+                    saveAvro(chunk.map(row => Avro.createGenericRecord(schema, row)), avroSchema)(
+                      dataWritten,
+                      avroWriter,
+                      partition
+                    )
+                  }
+                  .getOrElse(ZIO.unit)
             }
             _ <- ZIO.foreach_(tail.zip(c.children)) { case (parentStream, (childEntity, serviceConfig)) =>
-              val childEntityPartition = partitions(childEntity, LocalDateTime.now(JClock.systemUTC()), config.launchId)
+              val childEntityPartition = partitions(serviceConfig.name, LocalDateTime.now(JClock.systemUTC()), config.launchId)
               Ref.make(false).flatMap { writeFlag =>
                 parentStream.chunkN(serviceConfig.subsequentBatchSize).foreachChunk { rowChunk =>
                   val updatedPayload = serviceConfig.childPayloadTransformer(rowChunk.toList, serviceConfig.payload)
                   load(writeFlag, childEntity, serviceConfig, updatedPayload, childEntityPartition)(call)
-                } *> writeFlag.get >>= (ZIO.when(_)(logger.state(config, childEntity, childEntityPartition, "SUCCESS")))
+                } *> writeFlag.get >>= (ZIO.when(_)(logger.state(config, serviceConfig.name, childEntityPartition, "SUCCESS")))
               }
             }
           } yield ()
@@ -79,7 +81,7 @@ class SoapDataTransport(client: SoapClient.Service, avroWriter: AvroWriter.Servi
 object SoapDataTransport {
   val MaxLag = 1000
 
-  protected def delayCall(s: ServiceEntity) = s.delayCall match {
+  protected def delayCall(s: ServiceEntity): UIO[Unit] = s.delayCall match {
     case Some(duration) =>
       ZIO.unit.delay(Duration.ofSeconds(duration.toSeconds)).provideLayer(Clock.live)
     case None => ZIO.unit
@@ -91,7 +93,7 @@ object SoapDataTransport {
     partition: String
   ): ZIO[Any, Throwable, String] =
     avroWriter.writeAvro(s"$partition/data_${UUID.randomUUID()}.avro", chunk, avroSchema) <*
-    dataWritten.set(true)
+      dataWritten.set(true)
 
   protected def partitions(root: String, ldt: LocalDateTime, id: String) =
     f"$root/year=${ldt.getYear}/month=${ldt.getMonth.getValue}%02d/day=${ldt.getDayOfMonth}%02d/hour=${ldt.getHour}%02d/etlid=$id"

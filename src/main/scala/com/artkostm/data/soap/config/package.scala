@@ -1,33 +1,36 @@
-package com.artkostm.data.soap
+package com.artkostm.data.ingest.p6
 
-import com.artkostm.data.landing.rest.config._
-import com.sandinh.soap.SOAP
-import pureconfig.ConfigConvert
-import pureconfig.ConfigConvert.{catchReadError, viaNonEmptyString}
+import com.artkostm.data.ingest.p6.config.transformer.ChildPayloadTransformer
+import com.artkostm.data.landing.rest.config.{AppConfig, AzureBlobConfig, ConfigProvider, PureConfig}
+
 import zio.{Layer, ZLayer}
-
-import scala.xml.NamespaceBinding
-// format: off
-import pureconfig.configurable._
-import pureconfig.generic.auto._
-// format: on
 
 import java.io.File
 import java.util.UUID
 import scala.concurrent.duration.Duration
 
+// format: off
+import pureconfig.configurable._
+import pureconfig.generic.auto._
+// format: on
+
+
 package object config {
   import com.artkostm.data.landing.rest.config.PureConfig._
+  import com.artkostm.data.soap.config._
 
-  final case class SoapEntityConfig(entity: String)
-
-  final case class SoapAuthConfig(username: Secret, password: Secret) extends AuthConfig
-
-  final case class SoapClientConfig(baseUrl: String,
-                                    auth: SoapAuthConfig,
-                                    retry: RetryConfig = RetryConfig.default,
-                                    readTimeOut: Duration = Duration("10 minutes"))
-    extends ClientConfig
+  final case class P6TransportConfig(client: SoapClientConfig,
+                                     transport: Map[String, ServiceEntity],
+                                     azure: AzureBlobConfig = AzureBlobConfig.default,
+                                     projectsToLoad: Map[String, Int] = Map.empty,
+                                     chunkSize: Int = 10000,
+                                     parallelization: Int = 1,
+                                     monitoringConnectionKey: String = "",
+                                     dataSource: String = "P6Ingest",
+                                     appName: String = "P6TransportApp",
+                                     launchId: String = UUID.randomUUID().toString,
+                                     rootDir: File = new File("out/P6"))
+    extends SoapTransportConfig
 
   trait SoapTransportConfig extends AppConfig {
     val parallelization: Int
@@ -35,46 +38,16 @@ package object config {
     val chunkSize: Int
   }
 
-  sealed trait ChildPayloadTransformer extends ((List[Map[String, String]], Map[String, List[String]]) => Seq[Map[String, List[String]]])
-
-  object ChildPayloadTransformer {
-    object Identity extends ChildPayloadTransformer {
-      override def apply(rows: List[Map[String, String]], payload: Map[String, List[String]]): Seq[Map[String, List[String]]] = Seq(payload)
-    }
-
-    object RiskAssignmentSpreadTransformer extends ChildPayloadTransformer {
-      override def apply(rows: List[Map[String, String]], payload: Map[String, List[String]]): Seq[Map[String, List[String]]] = {
-        Seq(
-          payload ++ Seq(
-            "ResourceAssignmentObjectId" -> rows.flatMap(_.get("ObjectId")),
-            "StartDate"                  -> List(rows.flatMap(r => r.get("FinishDate")).min),
-            "EndDate"                    -> List(rows.flatMap(r => r.get("ActualFinishDate") orElse r.get("PlannedFinishDate") orElse r.get("FinishDate")).max)
-          )
-        )
-      }
-    }
-  }
-
-  final case class ServiceEntity(service: String,
-                                 action: String,
-                                 xmlElement: String,
-                                 namespace: NsWrapper,
-                                 payload: Map[String, List[String]] = Map.empty,
-                                 children: Map[String, ServiceEntity] = Map.empty,
+  final case class ServiceEntity(action: String,
+                                 wsdlUrl: String,
+                                 name: String,
+                                 payload: Map[String, List[String]] = Map.empty[String, List[String]],
+                                 children: Map[String, ServiceEntity] = Map.empty[String, ServiceEntity],
                                  childPayloadTransformer: ChildPayloadTransformer = ChildPayloadTransformer.Identity,
                                  subsequentBatchSize: Int = 50,
-                                 delayCall: Option[Duration] = None,
-                                 name: String)
-
-  final case class NsWrapper(value: NamespaceBinding) extends AnyVal
-
-  implicit val namespaceConverter: ConfigConvert[NsWrapper] =
-    viaNonEmptyString[NsWrapper](
-      catchReadError { key =>
-        NsWrapper(NamespaceBinding("v1", key, SOAP.SoapNS))
-      },
-      _.value.uri
-    )
+                                 delayCall: Option[Duration] = None)
 
 
+  def configProvider: Layer[Nothing, ConfigProvider[P6TransportConfig]] =
+    ZLayer.succeed(new PureConfig[P6TransportConfig])
 }
