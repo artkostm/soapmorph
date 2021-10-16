@@ -24,7 +24,7 @@ class SoapDataTransport(client: SoapClient.Service, avroWriter: AvroWriter.Servi
   type ApiCall = (ServiceEntity, Map[String, List[String]]) => Task[GenericStreamingResponse]
 
   override def run(enrichPayload: PayloadTransformer): Task[Unit] =
-    ZIO.foreach_(config.transport) {
+    ZIO.foreach_(config.transport -- Seq(LiveProjectsConfigName)) {
       case (entityName, c) =>
         val partition = partitions(c.name, LocalDateTime.now(JClock.systemUTC()), config.launchId)
         Ref.make(false).flatMap { dataWritten =>
@@ -40,46 +40,70 @@ class SoapDataTransport(client: SoapClient.Service, avroWriter: AvroWriter.Servi
                    payload: Seq[Map[String, List[String]]],
                    partition: String)(call: ApiCall): Task[Unit] =
     for {
-      _ <- logger.info(s"Loading data for $entityName...")
-      genericStreamingResponse <- ZIO.foreachParN(config.parallelization)(payload) { p =>
-        call(c, p).map(s => (s._1, s._2.chunkN(config.chunkSize)))
-      }
-      (schema, stream) = genericStreamingResponse.foldLeft((SchemaF.emptyStruct, Stream.succeed(DataF.nullF)): (Fix[SchemaF], Stream[Throwable, Fix[DataF]])) {
-        case ((_, accStream), (sc, stream)) => sc -> accStream.filter(DataF.isNotNull).merge(stream)
-      }
-      avroSchema = Avro.toAvroSchema(schema)
-      mainStream = stream.broadcast(c.children.size + 1, MaxLag)
+      _         <- logger.info(s"Loading data for $entityName...")
+      schemaRef <- Promise.make[Throwable, Fix[SchemaF]]
+      genericStreamingResponse = Stream
+        .fromIterable(payload)
+        .mapM(
+          p =>
+            logger.info(s"Request payload: ${p.--(Seq("Field", "SpreadField")).mkString("{", ", ", "}")}") *>
+            call(c, p).retryN(1).catchAll(catchAndLog(c, p)(_)).flatMap {
+              case (s, stream) => ZIO.whenM(schemaRef.isDone.map(!_))(schemaRef.succeed(s)).as(stream.bufferUnbounded)
+          }
+        )
+        .flatMap(identity)
+      mainStream = genericStreamingResponse.chunkN(c.chunkSize).broadcast(c.children.size + 1, c.maxLag)
       _ <- mainStream.use {
-        case toSave :: tail =>
-          for {
-            _ <- toSave.foreachChunk { chunk =>
-              chunk.headOption
-                  .map { _ =>
-                    saveAvro(chunk.map(row => Avro.createGenericRecord(schema, row)), avroSchema)(
-                      dataWritten,
-                      avroWriter,
-                      partition
-                    )
-                  }
-                  .getOrElse(ZIO.unit)
-            }
-            _ <- ZIO.foreach_(tail.zip(c.children)) { case (parentStream, (childEntity, serviceConfig)) =>
-              val childEntityPartition = partitions(serviceConfig.name, LocalDateTime.now(JClock.systemUTC()), config.launchId)
-              Ref.make(false).flatMap { writeFlag =>
-                parentStream.chunkN(serviceConfig.subsequentBatchSize).foreachChunk { rowChunk =>
-                  val updatedPayload = serviceConfig.childPayloadTransformer(rowChunk.toList, serviceConfig.payload)
-                  load(writeFlag, childEntity, serviceConfig, updatedPayload, childEntityPartition)(call)
-                } *> writeFlag.get >>= (ZIO.when(_)(logger.state(config, serviceConfig.name, childEntityPartition, "SUCCESS")))
-              }
-            }
-          } yield ()
-      }
+            case toSave :: tail =>
+              for {
+                schema     <- schemaRef.await
+                avroSchema = Avro.toAvroSchema(schema)
+                saveTask <- toSave.foreachChunk { chunk =>
+                      chunk.headOption.map { _ =>
+                        saveAvro(chunk.map(row => Avro.createGenericRecord[cats.Id](schema, row)), avroSchema)(
+                          dataWritten,
+                          avroWriter,
+                          partition
+                        )
+                      }.getOrElse(ZIO.unit)
+                    }.fork
+                processChildrenTask <- ZIO.foreach_(tail.zip(c.children)) {
+                      case (parentStream, (childEntity, serviceConfig)) =>
+                        val childEntityPartition = partitions(serviceConfig.name,
+                                                              LocalDateTime.now(JClock.systemUTC()),
+                                                              config.launchId)
+                        Ref.make(false).flatMap { writeFlag =>
+                          parentStream.chunkN(serviceConfig.subsequentBatchSize).foreachChunk { rowChunk =>
+                            val updatedPayload =
+                              serviceConfig.childPayloadTransformer(rowChunk.toList, serviceConfig.payload)
+                            load(writeFlag, childEntity, serviceConfig, updatedPayload, childEntityPartition)(
+                              call
+                            )
+                          } *> writeFlag.get >>= (ZIO.when(_)(
+                            logger.state(config, serviceConfig.name, childEntityPartition, "SUCCESS")
+                          ))
+                        }
+                    }.fork
+                _ <- (saveTask zip processChildrenTask).join
+              } yield ()
+          }
       _ <- logger.info("...done")
     } yield ()
 }
 
 object SoapDataTransport {
   val MaxLag = 1000
+  
+  protected def catchAndLog(s: ServiceEntity, payload: Map[String, List[String]])(error: Throwable): Task[GenericStreamingResponse] = {
+    logger.error(
+      s"""
+         |Call for ${s.action} ended up with the following error:
+         |
+         |  ${error.getMessage},
+         |  Payload: ${payload.--(Seq("Field", "SpreadField")).mkString("{", ", ", "}")}
+         |
+         |""".stripMargin) *> Task.succeed((SchemaF.emptyStruct, Stream.empty))
+  }
 
   protected def delayCall(s: ServiceEntity): UIO[Unit] = s.delayCall match {
     case Some(duration) =>

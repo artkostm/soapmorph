@@ -1,14 +1,22 @@
 package com.artkostm.data.soap.client.schema
 
+
 import cats.implicits._
-import cats.{Applicative, Functor}
+import cats.{Applicative, Functor, Traverse}
 import com.artkostm.data.soap.client.schema.SchemaF._
 import higherkindness.droste.data.Fix
 import higherkindness.droste.syntax.all.toFixSyntaxOps
+import higherkindness.droste.util.DefaultTraverse
 
+import java.sql.{Date, Timestamp}
+import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.temporal.ChronoUnit
 import scala.language.higherKinds
+import scala.util.Try
 
 sealed trait SchemaF[A] {
+  val nullable: Boolean
 
   def traverse[F[_]: Applicative, B](f: A => F[B]): F[SchemaF[B]] = this match {
     case StructF(fields, n) =>
@@ -30,15 +38,24 @@ sealed trait SchemaF[A] {
     case IntF(n)           => (IntF[B](n): SchemaF[B]).pure[F]
     case ByteF(n)          => (ByteF[B](n): SchemaF[B]).pure[F]
     case ShortF(n)         => (ShortF[B](n): SchemaF[B]).pure[F]
+    case DatetimeF(n, f)   => (DatetimeF[B](n, f): SchemaF[B]).pure[F]
+    case DateF(n)          => (DateF[B](n): SchemaF[B]).pure[F]
   }
 }
 
-sealed trait ValueF[A, B] extends SchemaF[A] {
-  val nullable: Boolean
-}
+sealed trait ValueF[A, B] extends SchemaF[A]
 
 object SchemaF {
-  final case class StructF[A](fields: Map[String, A], nullable: Boolean)      extends SchemaF[A]
+  implicit class FixedSchema(s: Fix[SchemaF]) {
+    def add(name: String, child: Fix[SchemaF]): Fix[SchemaF] = s match {
+      case Fix(ss: StructF[Fix[SchemaF]]) => ss.add(name, child).fix[SchemaF]
+      case x => throw new UnsupportedOperationException(s"Cannot add schema $child to $x")
+    }
+  }
+
+  final case class StructF[A](fields: Map[String, A], nullable: Boolean) extends SchemaF[A] {
+    def add(name: String, value: A): SchemaF[A] = StructF[A](fields + (name -> value), nullable)
+  }
   final case class ArrayF[A](element: A, nullable: Boolean)                   extends SchemaF[A]
   final case class StringF[A](nullable: Boolean)                              extends ValueF[A, String]
   final case class DecimalF[A](precision: Int, scale: Int, nullable: Boolean) extends ValueF[A, BigDecimal]
@@ -49,6 +66,28 @@ object SchemaF {
   final case class IntF[A](nullable: Boolean)                                 extends ValueF[A, Int]
   final case class ByteF[A](nullable: Boolean)                                extends ValueF[A, Byte]
   final case class ShortF[A](nullable: Boolean)                               extends ValueF[A, Short]
+  final case class DatetimeF[A](nullable: Boolean, format: DatetimeF.Format)  extends ValueF[A, Long]
+  final case class DateF[A](nullable: Boolean)                                extends ValueF[A, Int]
+
+  object DatetimeF {
+    sealed trait Format
+    case object TimestampMicros extends Format
+    final case class StringFormat(formats: List[String] = StringFormat.Default) extends Format
+    object StringFormat {
+      val Default = List("yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd", "yyyy-MM-dd HH:mm:ss")
+    }
+
+    def toTs(micros: Long, format: Format): Timestamp = format match {
+      case TimestampMicros => Timestamp.from(Instant.EPOCH.plus(micros, ChronoUnit.MICROS))
+    }
+
+    def toTs(date: String, format: Format): Timestamp = format match {
+      case StringFormat(patterns) =>
+        patterns.map(pattern => Try(Timestamp.from(new SimpleDateFormat(pattern).parse(date).toInstant))).flatMap(_.toOption).head
+    }
+
+    def toDate(days: Int): Date = new Date(Instant.EPOCH.plus(days, ChronoUnit.DAYS).toEpochMilli)
+  }
 
   val emptyStruct: Fix[SchemaF] = StructF(Map.empty, true).fix[SchemaF]
 
@@ -84,11 +123,14 @@ object SchemaF {
       case IntF(n)            => IntF[B](n)
       case ByteF(n)           => ByteF[B](n)
       case ShortF(n)          => ShortF[B](n)
+      case DatetimeF(n, f)    => DatetimeF[B](n, f)
+      case DateF(n)           => DateF[B](n)
     }
   }
 
-//  implicit val schemaTraverse: Traverse[SchemaF] = new DefaultTraverse[SchemaF] {
-//    override def traverse[G[_]: Applicative, A, B](fa: SchemaF[A])(f: A => G[B]): G[SchemaF[B]] =
-//      fa.traverse(f)
-//  }
+  implicit val schemaTraverse: Traverse[SchemaF] = new DefaultTraverse[SchemaF] {
+    override def traverse[G[_]: Applicative, A, B](fa: SchemaF[A])(f: A => G[B]): G[SchemaF[B]] =
+      fa.traverse(f)
+  }
 }
+

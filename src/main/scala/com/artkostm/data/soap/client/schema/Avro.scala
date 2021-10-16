@@ -8,13 +8,16 @@ import com.artkostm.data.soap.client.schema.SchemaF._
 import higherkindness.droste._
 import higherkindness.droste.data._
 import higherkindness.droste.data.prelude._
-import org.apache.avro.Schema
+import org.apache.avro.{LogicalTypes, Schema}
 import org.apache.avro.Schema.Type
 import org.apache.avro.generic.{GenericData, GenericRecord}
 import org.slf4j.{Logger, LoggerFactory}
 
+import java.time.Instant
+import java.time.temporal.ChronoUnit
 import scala.collection.JavaConverters._
 import scala.language.higherKinds
+
 
 object Avro {
   protected val LOGGER: Logger = LoggerFactory.getLogger(getClass)
@@ -48,6 +51,10 @@ object Avro {
     case StringF(n)         => unionSchema(Schema.create(Schema.Type.STRING), n)
     case LongF(n)           => unionSchema(Schema.create(Schema.Type.LONG), n)
     case IntF(n)            => unionSchema(Schema.create(Schema.Type.INT), n)
+    case DatetimeF(n, f)    =>
+      unionSchema(f match {
+        case DatetimeF.TimestampMicros | DatetimeF.StringFormat(_) => LogicalTypes.timestampMicros().addToSchema(Schema.create(Schema.Type.LONG))
+      }, n)
   }
 
   // monadic algebra to create a generic record out of M[EnvT[(SchemaF, DataF)]]
@@ -69,6 +76,11 @@ object Avro {
           case Right(value) => value
           case Left(value)  => value
         }.asJava): Either[Any, GenericRecord]).pure[M]
+      case AttrF(Fix(DatetimeF(_, f)), v: GDatetime[_]) =>
+        f match {
+          case DatetimeF.TimestampMicros | DatetimeF.StringFormat(_) =>
+            (Left(ChronoUnit.MICROS.between(Instant.EPOCH, v.value.toInstant)): Either[Any, GenericRecord]).pure[M]
+        }
       case AttrF(_, v: GValue[_]) => (Left(v.value): Either[Any, GenericRecord]).pure[M]
       case AttrF(_, _)            => throw new RuntimeException("Should not happen")
     }
